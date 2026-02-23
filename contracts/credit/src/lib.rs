@@ -39,11 +39,10 @@ pub struct Credit;
 #[contractimpl]
 impl Credit {
     /// Initialize the contract (admin).
-    pub fn init(env: Env, admin: Address) -> () {
+    pub fn init(env: Env, admin: Address) {
         env.storage()
             .instance()
             .set(&Symbol::new(&env, "admin"), &admin);
-        ()
     }
 
     /// Open a new credit line for a borrower (called by backend/risk engine).
@@ -54,7 +53,7 @@ impl Credit {
         credit_limit: i128,
         interest_rate_bps: u32,
         risk_score: u32,
-    ) -> () {
+    ) {
         let credit_line = CreditLineData {
             borrower: borrower.clone(),
             credit_limit,
@@ -78,11 +77,10 @@ impl Credit {
                 risk_score,
             },
         );
-        ()
     }
 
     /// Draw from credit line (borrower).
-    pub fn draw_credit(env: Env, borrower: Address, amount: i128) -> () {
+    pub fn draw_credit(env: Env, borrower: Address, amount: i128) {
         borrower.require_auth();
 
         let mut credit_line: CreditLineData = env
@@ -104,11 +102,10 @@ impl Credit {
 
         credit_line.utilized_amount += amount;
         env.storage().persistent().set(&borrower, &credit_line);
-        ()
     }
 
     /// Repay credit (borrower).
-    pub fn repay_credit(env: Env, borrower: Address, amount: i128) -> () {
+    pub fn repay_credit(env: Env, borrower: Address, amount: i128) {
         borrower.require_auth();
 
         let mut credit_line: CreditLineData = env
@@ -125,7 +122,6 @@ impl Credit {
 
         credit_line.utilized_amount -= amount;
         env.storage().persistent().set(&borrower, &credit_line);
-        ()
     }
 
     /// Update risk parameters (admin/risk engine).
@@ -135,14 +131,13 @@ impl Credit {
         _credit_limit: i128,
         _interest_rate_bps: u32,
         _risk_score: u32,
-    ) -> () {
+    ) {
         // TODO: update stored CreditLineData
-        ()
     }
 
     /// Suspend a credit line (admin).
     /// Emits a CreditLineSuspended event.
-    pub fn suspend_credit_line(env: Env, borrower: Address) -> () {
+    pub fn suspend_credit_line(env: Env, borrower: Address) {
         let mut credit_line: CreditLineData = env
             .storage()
             .persistent()
@@ -164,12 +159,11 @@ impl Credit {
                 risk_score: credit_line.risk_score,
             },
         );
-        ()
     }
 
     /// Close a credit line (admin or borrower when utilized is 0).
     /// Emits a CreditLineClosed event.
-    pub fn close_credit_line(env: Env, borrower: Address) -> () {
+    pub fn close_credit_line(env: Env, borrower: Address) {
         let mut credit_line: CreditLineData = env
             .storage()
             .persistent()
@@ -191,12 +185,11 @@ impl Credit {
                 risk_score: credit_line.risk_score,
             },
         );
-        ()
     }
 
     /// Mark a credit line as defaulted (admin).
     /// Emits a CreditLineDefaulted event.
-    pub fn default_credit_line(env: Env, borrower: Address) -> () {
+    pub fn default_credit_line(env: Env, borrower: Address) {
         let mut credit_line: CreditLineData = env
             .storage()
             .persistent()
@@ -218,7 +211,6 @@ impl Credit {
                 risk_score: credit_line.risk_score,
             },
         );
-        ()
     }
 
     /// Get credit line data for a borrower (view function).
