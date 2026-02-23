@@ -1,6 +1,8 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol,
+};
 
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -21,6 +23,14 @@ pub struct CreditLineData {
     pub status: CreditStatus,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DataKey {
+    Admin,
+    LiquidityToken,
+    LiquiditySource,
+}
+
 /// Event emitted when a credit line lifecycle event occurs
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -38,9 +48,43 @@ pub struct Credit;
 
 #[contractimpl]
 impl Credit {
-    /// Initialize the contract (admin).
+    /// @notice Initializes contract-level configuration.
+    /// @dev Sets admin and defaults liquidity source to this contract address.
     pub fn init(env: Env, admin: Address) -> () {
-        env.storage().instance().set(&Symbol::new(&env, "admin"), &admin);
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::LiquiditySource, &env.current_contract_address());
+        ()
+    }
+
+    /// @notice Sets the token contract used for reserve/liquidity checks and draw transfers.
+    /// @dev Admin-only.
+    pub fn set_liquidity_token(env: Env, token_address: Address) -> () {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::LiquidityToken, &token_address);
+        ()
+    }
+
+    /// @notice Sets the address that provides liquidity for draw operations.
+    /// @dev Admin-only. If unset, init config uses the contract address.
+    pub fn set_liquidity_source(env: Env, reserve_address: Address) -> () {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::LiquiditySource, &reserve_address);
         ()
     }
 
@@ -62,9 +106,7 @@ impl Credit {
             status: CreditStatus::Active,
         };
 
-        env.storage()
-            .persistent()
-            .set(&borrower, &credit_line);
+        env.storage().persistent().set(&borrower, &credit_line);
 
         // Emit CreditLineOpened event
         env.events().publish(
@@ -81,9 +123,55 @@ impl Credit {
         ()
     }
 
-    /// Draw from credit line (borrower).
-    pub fn draw_credit(_env: Env, _borrower: Address, _amount: i128) -> () {
-        // TODO: check limit, update utilized_amount, transfer token to borrower
+    /// @notice Draws credit by transferring liquidity tokens to the borrower.
+    /// @dev Enforces status/limit checks and reverts when reserve balance is insufficient.
+    pub fn draw_credit(env: Env, borrower: Address, amount: i128) -> () {
+        borrower.require_auth();
+
+        if amount <= 0 {
+            panic!("Draw amount must be positive");
+        }
+
+        let token_address: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::LiquidityToken)
+            .expect("Liquidity token not configured");
+        let reserve_address: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::LiquiditySource)
+            .unwrap_or(env.current_contract_address());
+
+        let mut credit_line: CreditLineData = env
+            .storage()
+            .persistent()
+            .get(&borrower)
+            .expect("Credit line not found");
+
+        if credit_line.status != CreditStatus::Active {
+            panic!("Credit line is not active");
+        }
+
+        let updated_utilized = credit_line
+            .utilized_amount
+            .checked_add(amount)
+            .expect("Utilized amount overflow");
+
+        if updated_utilized > credit_line.credit_limit {
+            panic!("Credit limit exceeded");
+        }
+
+        let token_client = token::Client::new(&env, &token_address);
+        let reserve_balance = token_client.balance(&reserve_address);
+        if reserve_balance < amount {
+            panic!("Insufficient liquidity reserve for requested draw amount");
+        }
+
+        token_client.transfer(&reserve_address, &borrower, &amount);
+
+        credit_line.utilized_amount = updated_utilized;
+        env.storage().persistent().set(&borrower, &credit_line);
         ()
     }
 
@@ -115,9 +203,7 @@ impl Credit {
             .expect("Credit line not found");
 
         credit_line.status = CreditStatus::Suspended;
-        env.storage()
-            .persistent()
-            .set(&borrower, &credit_line);
+        env.storage().persistent().set(&borrower, &credit_line);
 
         // Emit CreditLineSuspended event
         env.events().publish(
@@ -144,9 +230,7 @@ impl Credit {
             .expect("Credit line not found");
 
         credit_line.status = CreditStatus::Closed;
-        env.storage()
-            .persistent()
-            .set(&borrower, &credit_line);
+        env.storage().persistent().set(&borrower, &credit_line);
 
         // Emit CreditLineClosed event
         env.events().publish(
@@ -173,9 +257,7 @@ impl Credit {
             .expect("Credit line not found");
 
         credit_line.status = CreditStatus::Defaulted;
-        env.storage()
-            .persistent()
-            .set(&borrower, &credit_line);
+        env.storage().persistent().set(&borrower, &credit_line);
 
         // Emit CreditLineDefaulted event
         env.events().publish(
@@ -202,12 +284,13 @@ impl Credit {
 mod test {
     use super::*;
     use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::token::StellarAssetClient;
 
     #[test]
     fn test_init_and_open_credit_line() {
         let env = Env::default();
         env.mock_all_auths();
-        
+
         let admin = Address::generate(&env);
         let borrower = Address::generate(&env);
 
@@ -233,7 +316,7 @@ mod test {
     fn test_suspend_credit_line() {
         let env = Env::default();
         env.mock_all_auths();
-        
+
         let admin = Address::generate(&env);
         let borrower = Address::generate(&env);
 
@@ -253,7 +336,7 @@ mod test {
     fn test_close_credit_line() {
         let env = Env::default();
         env.mock_all_auths();
-        
+
         let admin = Address::generate(&env);
         let borrower = Address::generate(&env);
 
@@ -273,7 +356,7 @@ mod test {
     fn test_default_credit_line() {
         let env = Env::default();
         env.mock_all_auths();
-        
+
         let admin = Address::generate(&env);
         let borrower = Address::generate(&env);
 
@@ -293,7 +376,7 @@ mod test {
     fn test_full_lifecycle() {
         let env = Env::default();
         env.mock_all_auths();
-        
+
         let admin = Address::generate(&env);
         let borrower = Address::generate(&env);
 
@@ -322,7 +405,7 @@ mod test {
     fn test_event_data_integrity() {
         let env = Env::default();
         env.mock_all_auths();
-        
+
         let admin = Address::generate(&env);
         let borrower = Address::generate(&env);
 
@@ -387,7 +470,7 @@ mod test {
     fn test_multiple_borrowers() {
         let env = Env::default();
         env.mock_all_auths();
-        
+
         let admin = Address::generate(&env);
         let borrower1 = Address::generate(&env);
         let borrower2 = Address::generate(&env);
@@ -412,7 +495,7 @@ mod test {
     fn test_lifecycle_transitions() {
         let env = Env::default();
         env.mock_all_auths();
-        
+
         let admin = Address::generate(&env);
         let borrower = Address::generate(&env);
 
@@ -433,5 +516,62 @@ mod test {
             client.get_credit_line(&borrower).unwrap().status,
             CreditStatus::Defaulted
         );
+    }
+
+    #[test]
+    fn test_draw_credit_with_sufficient_liquidity() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.open_credit_line(&borrower, &1_000_i128, &300_u32, &70_u32);
+
+        let token = env.register_stellar_asset_contract_v2(token_admin);
+        let token_admin_client = StellarAssetClient::new(&env, &token.address());
+        let token_client = token::Client::new(&env, &token.address());
+
+        client.set_liquidity_token(&token.address());
+
+        token_admin_client.mint(&contract_id, &500_i128);
+        client.draw_credit(&borrower, &200_i128);
+
+        assert_eq!(token_client.balance(&contract_id), 300_i128);
+        assert_eq!(token_client.balance(&borrower), 200_i128);
+        assert_eq!(
+            client.get_credit_line(&borrower).unwrap().utilized_amount,
+            200_i128
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Insufficient liquidity reserve for requested draw amount")]
+    fn test_draw_credit_with_insufficient_liquidity() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.open_credit_line(&borrower, &1_000_i128, &300_u32, &70_u32);
+
+        let token = env.register_stellar_asset_contract_v2(token_admin);
+        let token_admin_client = StellarAssetClient::new(&env, &token.address());
+
+        client.set_liquidity_token(&token.address());
+
+        token_admin_client.mint(&contract_id, &50_i128);
+        client.draw_credit(&borrower, &100_i128);
     }
 }
