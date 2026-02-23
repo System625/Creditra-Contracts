@@ -13,6 +13,13 @@ This repo contains the **credit** contract: it will maintain credit lines, track
 
 **Methods:** `init`, `open_credit_line`, `draw_credit`, `repay_credit`, `update_risk_parameters`, `suspend_credit_line`, `close_credit_line`.
 
+### Suspend credit line behavior
+
+- `suspend_credit_line` is **admin only** and requires the credit line to exist.
+- Only lines in `Active` status can be suspended.
+- `draw_credit` rejects any draw when the line is not `Active` (including `Suspended`).
+- Repayments are intended to remain allowed while suspended.
+
 ## Tech Stack
 
 - **Rust** (edition 2021)
