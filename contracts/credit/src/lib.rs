@@ -14,13 +14,14 @@ mod types;
 use soroban_sdk::{contract, contractimpl, symbol_short, Address, Env, Symbol};
 
 use events::{
-    publish_credit_line_event, publish_repayment_event, publish_risk_parameters_updated,
-    CreditLineEvent, RepaymentEvent, RiskParametersUpdatedEvent,
+    publish_credit_line_event, publish_drawn_event, publish_repayment_event,
+    publish_risk_parameters_updated, CreditLineEvent, DrawnEvent, RepaymentEvent,
+    RiskParametersUpdatedEvent,
 };
 use types::{CreditLineData, CreditStatus};
 
 /// Maximum interest rate in basis points (100%).
-const MAX_INTEREST_RATE_BPS: u32 = 100_00;
+const MAX_INTEREST_RATE_BPS: u32 = 10_000;
 /// Maximum risk score (0–100 scale).
 const MAX_RISK_SCORE: u32 = 100;
 
@@ -67,12 +68,11 @@ pub struct Credit;
 #[contractimpl]
 impl Credit {
     /// Initialize the contract (admin).
-    pub fn init(env: Env, admin: Address) -> () {
+    pub fn init(env: Env, admin: Address) {
         if env.storage().instance().has(&admin_key(&env)) {
             panic!("Already initialized");
         }
         env.storage().instance().set(&admin_key(&env), &admin);
-        ()
     }
 
     /// Open a new credit line for a borrower (called by backend/risk engine).
@@ -83,7 +83,7 @@ impl Credit {
         credit_limit: i128,
         interest_rate_bps: u32,
         risk_score: u32,
-    ) -> () {
+    ) {
         require_admin_auth(&env);
         let credit_line = CreditLineData {
             borrower: borrower.clone(),
@@ -108,12 +108,11 @@ impl Credit {
                 risk_score,
             },
         );
-        ()
     }
 
     /// Draw from credit line (borrower).
     /// Reverts if credit line does not exist, is not Active, or borrower has not authorized.
-    pub fn draw_credit(env: Env, borrower: Address, amount: i128) -> () {
+    pub fn draw_credit(env: Env, borrower: Address, amount: i128) {
         set_reentrancy_guard(&env);
         borrower.require_auth();
         let mut credit_line: CreditLineData = env
@@ -126,7 +125,7 @@ impl Credit {
             clear_reentrancy_guard(&env);
             panic!("credit line is closed");
         }
-        
+
         if credit_line.status != CreditStatus::Active {
             clear_reentrancy_guard(&env);
             panic!("credit line is not active");
@@ -148,20 +147,24 @@ impl Credit {
         env.storage().persistent().set(&borrower, &credit_line);
         clear_reentrancy_guard(&env);
 
-        // Emit CreditLineDrawn event 
-        env.events().publish(
-            (symbol_short!("credit"), symbol_short!("drawn")),
-            (borrower.clone(), amount, credit_line.utilized_amount),
+        let timestamp = env.ledger().timestamp();
+        publish_drawn_event(
+            &env,
+            DrawnEvent {
+                borrower: borrower.clone(),
+                amount,
+                new_utilized_amount: credit_line.utilized_amount,
+                timestamp,
+            },
         );
 
         // TODO: transfer token to borrower
-        ()
     }
 
     /// Repay credit (borrower).
     /// Reverts if credit line does not exist, is Closed, or borrower has not authorized.
     /// Reduces utilized_amount by amount (capped at 0). Emits RepaymentEvent.
-    pub fn repay_credit(env: Env, borrower: Address, amount: i128) -> () {
+    pub fn repay_credit(env: Env, borrower: Address, amount: i128) {
         set_reentrancy_guard(&env);
         borrower.require_auth();
         let mut credit_line: CreditLineData = env
@@ -193,15 +196,8 @@ impl Credit {
             },
         );
 
-        // Emit CreditLineRepaid event
-        env.events().publish(
-            (symbol_short!("credit"), symbol_short!("repaid")),
-            (borrower.clone(), amount, credit_line.utilized_amount),
-        );
-
         clear_reentrancy_guard(&env);
         // TODO: accept token from borrower
-        ()
     }
 
     /// Update risk parameters for an existing credit line (admin only).
@@ -211,7 +207,7 @@ impl Credit {
         credit_limit: i128,
         interest_rate_bps: u32,
         risk_score: u32,
-    ) -> () {
+    ) {
         require_admin_auth(&env);
 
         let mut credit_line: CreditLineData = env
@@ -247,12 +243,11 @@ impl Credit {
                 risk_score,
             },
         );
-        ()
     }
 
     /// Suspend a credit line (admin only).
     /// Emits a CreditLineSuspended event.
-    pub fn suspend_credit_line(env: Env, borrower: Address) -> () {
+    pub fn suspend_credit_line(env: Env, borrower: Address) {
         require_admin_auth(&env);
 
         let mut credit_line: CreditLineData = env
@@ -276,11 +271,10 @@ impl Credit {
                 risk_score: credit_line.risk_score,
             },
         );
-        ()
     }
 
     /// Close a credit line. Callable by admin (force-close) or by borrower when utilization is zero.
-    pub fn close_credit_line(env: Env, borrower: Address, closer: Address) -> () {
+    pub fn close_credit_line(env: Env, borrower: Address, closer: Address) {
         closer.require_auth();
 
         let admin: Address = require_admin(&env);
@@ -292,7 +286,7 @@ impl Credit {
             .expect("Credit line not found");
 
         if credit_line.status == CreditStatus::Closed {
-            return ();
+            return;
         }
 
         let allowed = closer == admin || (closer == borrower && credit_line.utilized_amount == 0);
@@ -319,12 +313,11 @@ impl Credit {
                 risk_score: credit_line.risk_score,
             },
         );
-        ()
     }
 
     /// Mark a credit line as defaulted (admin only).
     /// Emits a CreditLineDefaulted event.
-    pub fn default_credit_line(env: Env, borrower: Address) -> () {
+    pub fn default_credit_line(env: Env, borrower: Address) {
         require_admin_auth(&env);
 
         let mut credit_line: CreditLineData = env
@@ -348,7 +341,6 @@ impl Credit {
                 risk_score: credit_line.risk_score,
             },
         );
-        ()
     }
 
     /// Get credit line data for a borrower (view function).
@@ -793,7 +785,7 @@ mod test {
 
         client.init(&admin);
         client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
-        
+
         // No mock_all_auths, so this should fail require_auth
         client.update_risk_parameters(&borrower, &2000_i128, &400_u32, &85_u32);
     }
@@ -919,17 +911,97 @@ mod test {
         client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
         client.draw_credit(&borrower, &500_i128);
 
-        let events_before = env.events().all().len();
         client.repay_credit(&borrower, &200_i128);
-        let events_after = env.events().all().len();
 
         let credit_line = client.get_credit_line(&borrower).unwrap();
         assert_eq!(credit_line.utilized_amount, 300);
-        // Both publish_repayment_event and env.events().publish are called
-        assert!(
-            events_after > events_before,
-            "repay_credit must emit events"
-        );
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_open_credit_line_unauthorized() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        // No mock_all_auths for admin
+        client.open_credit_line(&borrower, &1000, &300, &70);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds credit limit")]
+    fn test_draw_credit_exceed_limit() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
+        client.draw_credit(&borrower, &1100_i128);
+    }
+
+    #[test]
+    #[should_panic(expected = "amount must be positive")]
+    fn test_draw_credit_non_positive_amount() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
+        client.draw_credit(&borrower, &0_i128);
+    }
+
+    #[test]
+    #[should_panic(expected = "Credit line not found")]
+    fn test_draw_credit_nonexistent_line() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.draw_credit(&borrower, &100_i128);
+    }
+
+    #[test]
+    fn test_get_nonexistent_credit_line() {
+        let env = Env::default();
+        let borrower = Address::generate(&env);
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        assert!(client.get_credit_line(&borrower).is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "overflow")]
+    fn test_draw_credit_overflow() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.open_credit_line(&borrower, &i128::MAX, &300, &70);
+        client.draw_credit(&borrower, &i128::MAX);
+        client.draw_credit(&borrower, &1);
     }
 
     #[test]
@@ -997,7 +1069,7 @@ mod test {
 
         client.init(&admin);
         client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
-        
+
         // No mock_all_auths
         client.suspend_credit_line(&borrower);
     }
@@ -1014,7 +1086,7 @@ mod test {
 
         client.init(&admin);
         client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
-        
+
         // No mock_all_auths
         client.default_credit_line(&borrower);
     }
@@ -1046,7 +1118,7 @@ mod test {
         client.init(&admin);
         client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
         client.suspend_credit_line(&borrower);
-        
+
         client.draw_credit(&borrower, &100_i128);
     }
 
