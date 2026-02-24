@@ -1,4 +1,4 @@
- #![no_std]
+#![no_std]
 
 //! Creditra credit contract: credit lines, draw/repay, risk parameters.
 //!
