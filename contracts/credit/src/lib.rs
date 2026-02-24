@@ -20,7 +20,7 @@ use events::{
 use types::{CreditLineData, CreditStatus};
 
 /// Maximum interest rate in basis points (100%).
-const MAX_INTEREST_RATE_BPS: u32 = 100_00;
+const MAX_INTEREST_RATE_BPS: u32 = 10_000;
 /// Maximum risk score (0–100 scale).
 const MAX_RISK_SCORE: u32 = 100;
 /// Instance storage key for reentrancy guard.
@@ -66,9 +66,8 @@ pub struct Credit;
 #[contractimpl]
 impl Credit {
     /// Initialize the contract (admin).
-    pub fn init(env: Env, admin: Address) -> () {
+    pub fn init(env: Env, admin: Address) {
         env.storage().instance().set(&admin_key(&env), &admin);
-        ()
     }
 
     /// Open a new credit line for a borrower (called by backend/risk engine).
@@ -107,7 +106,7 @@ impl Credit {
 
     /// Draw from credit line (borrower).
     /// Reverts if credit line does not exist, is Closed, or borrower has not authorized.
-    pub fn draw_credit(env: Env, borrower: Address, amount: i128) -> () {
+    pub fn draw_credit(env: Env, borrower: Address, amount: i128) {
         set_reentrancy_guard(&env);
         borrower.require_auth();
         let mut credit_line: CreditLineData = env
@@ -140,7 +139,7 @@ impl Credit {
     /// Repay credit (borrower).
     /// Reverts if credit line does not exist, is Closed, or borrower has not authorized.
     /// Reduces utilized_amount by amount (capped at 0). Emits RepaymentEvent.
-    pub fn repay_credit(env: Env, borrower: Address, amount: i128) -> () {
+    pub fn repay_credit(env: Env, borrower: Address, amount: i128) {
         set_reentrancy_guard(&env);
         borrower.require_auth();
         let mut credit_line: CreditLineData = env
@@ -172,7 +171,6 @@ impl Credit {
         );
         clear_reentrancy_guard(&env);
         // TODO: accept token from borrower
-        ()
     }
 
     /// Update risk parameters for an existing credit line (admin only).
@@ -195,7 +193,7 @@ impl Credit {
         credit_limit: i128,
         interest_rate_bps: u32,
         risk_score: u32,
-    ) -> () {
+    ) {
         require_admin_auth(&env);
 
         let mut credit_line: CreditLineData = env
@@ -231,12 +229,11 @@ impl Credit {
                 risk_score,
             },
         );
-        ()
     }
 
     /// Suspend a credit line (admin only).
     /// Emits a CreditLineSuspended event.
-    pub fn suspend_credit_line(env: Env, borrower: Address) -> () {
+    pub fn suspend_credit_line(env: Env, borrower: Address) {
         require_admin_auth(&env);
         let mut credit_line: CreditLineData = env
             .storage()
@@ -316,7 +313,7 @@ impl Credit {
 
     /// Mark a credit line as defaulted (admin only).
     /// Emits a CreditLineDefaulted event.
-    pub fn default_credit_line(env: Env, borrower: Address) -> () {
+    pub fn default_credit_line(env: Env, borrower: Address) {
         require_admin_auth(&env);
         let mut credit_line: CreditLineData = env
             .storage()
