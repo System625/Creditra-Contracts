@@ -4,6 +4,12 @@ Soroban smart contracts for the Creditra adaptive credit protocol on Stellar.
 
 ## About
 
+This repo contains the **credit** contract: it maintains credit lines, tracks utilization, enforces limits, and exposes methods for opening lines, drawing, repaying, and updating risk parameters. Token transfers and interest accrual are still TODO.
+
+**Behavior notes:**
+
+- after `suspend_credit_line`, `draw_credit` for that borrower reverts
+- `repay_credit` remains allowed while suspended
 This repo contains the **credit** contract: it will maintain credit lines, track utilization, enforce limits, and expose methods for opening lines, drawing, repaying, and updating risk parameters. The contract includes core logic for state management and events; additional features like interest accrual and token transfers are future enhancements.
 
 **Contract data model:**
@@ -11,7 +17,7 @@ This repo contains the **credit** contract: it will maintain credit lines, track
 - `CreditStatus`: Active, Suspended, Defaulted, Closed
 - `CreditLineData`: borrower, credit_limit, utilized_amount, interest_rate_bps, risk_score, status
 
-**Methods:** `init`, `open_credit_line`, `draw_credit`, `repay_credit`, `update_risk_parameters`, `suspend_credit_line`, `close_credit_line`.
+**Methods:** `init`, `open_credit_line`, `draw_credit`, `repay_credit`, `update_risk_parameters`, `suspend_credit_line`, `close_credit_line`, `default_credit_line`, `get_credit_line`.
 
 ## Tech Stack
 
@@ -79,6 +85,7 @@ See [Stellar Soroban docs](https://developers.stellar.org/docs/smart-contracts) 
 
 - `contracts/credit/` — credit line contract
   - `Cargo.toml` — crate config, soroban-sdk dependency
+  - `src/lib.rs` — contract types and implementation
   - `src/lib.rs` — contract types and impl
 
 ## Testing and Coverage

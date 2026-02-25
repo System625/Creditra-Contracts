@@ -1125,6 +1125,24 @@ mod test {
         client.repay_credit(&borrower, &100);
     }
 
+    #[test]
+    fn test_repay_credit_succeeds_when_suspended() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let borrower = Address::generate(&env);
+        let (client, _token, _admin) =
+            setup_contract_with_credit_line(&env, &borrower, 1_000, 1_000);
+
+        client.draw_credit(&borrower, &300);
+        client.suspend_credit_line(&borrower);
+
+        client.repay_credit(&borrower, &100);
+
+        let line = client.get_credit_line(&borrower).unwrap();
+        assert_eq!(line.status, CreditStatus::Suspended);
+        assert_eq!(line.utilized_amount, 200);
+    }
+
     // ── admin-only enforcement ────────────────────────────────────────────────
 
     #[test]
