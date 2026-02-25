@@ -1440,8 +1440,8 @@ mod test {
 
         // --- 2. First draw: 3 000 -------------------------------------------
         client.draw_credit(&borrower, &3_000_i128);
-        // draw_credit emits a (credit, draw) event
-        assert_eq!(env.events().all().len(), 1);
+        // draw_credit emits 2 events: SAC transfer event + (credit, draw) event
+        assert_eq!(env.events().all().len(), 2);
 
         let cl = client.get_credit_line(&borrower).unwrap();
         assert_eq!(cl.utilized_amount, 3_000);
@@ -1449,7 +1449,7 @@ mod test {
 
         // --- 3. Second draw: 2 000 (cumulative: 5 000) ----------------------
         client.draw_credit(&borrower, &2_000_i128);
-        assert_eq!(env.events().all().len(), 1);
+        assert_eq!(env.events().all().len(), 2);
 
         let cl = client.get_credit_line(&borrower).unwrap();
         assert_eq!(cl.utilized_amount, 5_000);
