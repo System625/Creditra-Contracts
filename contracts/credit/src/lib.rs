@@ -11,7 +11,7 @@
 mod events;
 mod types;
 
-use soroban_sdk::{contract, contractimpl, symbol_short, Address, Env, Symbol};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol};
 
 use events::{
     publish_credit_line_event, publish_repayment_event, publish_risk_parameters_updated,
@@ -20,7 +20,7 @@ use events::{
 use types::{CreditLineData, CreditStatus};
 
 /// Maximum interest rate in basis points (100%).
-const MAX_INTEREST_RATE_BPS: u32 = 100_00;
+const MAX_INTEREST_RATE_BPS: u32 = 10_000;
 /// Maximum risk score (0–100 scale).
 const MAX_RISK_SCORE: u32 = 100;
 /// Instance storage key for reentrancy guard.
@@ -37,6 +37,22 @@ fn require_admin(env: &Env) -> Address {
         .instance()
         .get(&admin_key(env))
         .expect("admin not set")
+}
+
+#[contracttype]
+#[derive(Debug, Clone, PartialEq)]
+pub enum CreditError {
+    CreditLineNotFound = 1,
+    InvalidCreditStatus = 2,
+    InvalidAmount = 3,
+    InsufficientUtilization = 4,
+    Unauthorized = 5,
+}
+
+impl Into<soroban_sdk::Error> for CreditError {
+    fn into(self) -> soroban_sdk::Error {
+        soroban_sdk::Error::from_contract_error(self as u32)
+    }
 }
 
 fn require_admin_auth(env: &Env) -> Address {
@@ -66,20 +82,52 @@ pub struct Credit;
 #[contractimpl]
 impl Credit {
     /// Initialize the contract (admin).
-    pub fn init(env: Env, admin: Address) -> () {
+    pub fn init(env: Env, admin: Address) {
         env.storage().instance().set(&admin_key(&env), &admin);
-        ()
     }
 
     /// Open a new credit line for a borrower (called by backend/risk engine).
-    /// Emits a CreditLineOpened event.
+    ///
+    /// # Arguments
+    /// * `borrower` - The address of the borrower
+    /// * `credit_limit` - Maximum borrowable amount (must be > 0)
+    /// * `interest_rate_bps` - Annual interest rate in basis points (max 10000 = 100%)
+    /// * `risk_score` - Borrower risk score (0–100)
+    ///
+    /// # Panics
+    /// * If `credit_limit` <= 0
+    /// * If `interest_rate_bps` > 10000
+    /// * If `risk_score` > 100
+    /// * If an Active credit line already exists for the borrower
+    ///
+    /// # Events
+    /// Emits `(credit, opened)` with a `CreditLineEvent` payload.
     pub fn open_credit_line(
         env: Env,
         borrower: Address,
         credit_limit: i128,
         interest_rate_bps: u32,
         risk_score: u32,
-    ) -> () {
+    ) {
+        assert!(credit_limit > 0, "credit_limit must be greater than zero");
+        assert!(
+            interest_rate_bps <= 10_000,
+            "interest_rate_bps cannot exceed 10000 (100%)"
+        );
+        assert!(risk_score <= 100, "risk_score must be between 0 and 100");
+
+        // Prevent overwriting an existing Active credit line
+        if let Some(existing) = env
+            .storage()
+            .persistent()
+            .get::<Address, CreditLineData>(&borrower)
+        {
+            assert!(
+                existing.status != CreditStatus::Active,
+                "borrower already has an active credit line"
+            );
+        }
+
         let credit_line = CreditLineData {
             borrower: borrower.clone(),
             credit_limit,
@@ -103,7 +151,6 @@ impl Credit {
                 risk_score,
             },
         );
-        ()
     }
 
     /// Draw from credit line (borrower).
@@ -146,13 +193,12 @@ impl Credit {
         env.storage().persistent().set(&borrower, &credit_line);
         clear_reentrancy_guard(&env);
         // TODO: transfer token to borrower
-        ()
     }
 
     /// Repay credit (borrower).
     /// Reverts if credit line does not exist, is Closed, or borrower has not authorized.
     /// Reduces utilized_amount by amount (capped at 0). Emits RepaymentEvent.
-    pub fn repay_credit(env: Env, borrower: Address, amount: i128) -> () {
+    pub fn repay_credit(env: Env, borrower: Address, amount: i128) {
         set_reentrancy_guard(&env);
         borrower.require_auth();
         let mut credit_line: CreditLineData = env
@@ -189,7 +235,6 @@ impl Credit {
         );
         clear_reentrancy_guard(&env);
         // TODO: accept token from borrower
-        ()
     }
 
     /// Update risk parameters for an existing credit line (admin only).
@@ -212,7 +257,7 @@ impl Credit {
         credit_limit: i128,
         interest_rate_bps: u32,
         risk_score: u32,
-    ) -> () {
+    ) {
         require_admin_auth(&env);
 
         let mut credit_line: CreditLineData = env
@@ -248,12 +293,11 @@ impl Credit {
                 risk_score,
             },
         );
-        ()
     }
 
     /// Suspend a credit line (admin only).
     /// Emits a CreditLineSuspended event.
-    pub fn suspend_credit_line(env: Env, borrower: Address) -> () {
+    pub fn suspend_credit_line(env: Env, borrower: Address) {
         require_admin_auth(&env);
 
         let mut credit_line: CreditLineData = env
@@ -277,7 +321,6 @@ impl Credit {
                 risk_score: credit_line.risk_score,
             },
         );
-        ()
     }
 
     /// Close a credit line. Callable by admin (force-close) or by borrower when utilization is zero.
@@ -292,7 +335,7 @@ impl Credit {
     ///   borrower closes while `utilized_amount != 0`.
     ///
     /// Emits a CreditLineClosed event.
-    pub fn close_credit_line(env: Env, borrower: Address, closer: Address) -> () {
+    pub fn close_credit_line(env: Env, borrower: Address, closer: Address) {
         closer.require_auth();
 
         let admin: Address = require_admin(&env);
@@ -304,7 +347,7 @@ impl Credit {
             .expect("Credit line not found");
 
         if credit_line.status == CreditStatus::Closed {
-            return ();
+            return;
         }
 
         let allowed = closer == admin || (closer == borrower && credit_line.utilized_amount == 0);
@@ -331,12 +374,11 @@ impl Credit {
                 risk_score: credit_line.risk_score,
             },
         );
-        ()
     }
 
     /// Mark a credit line as defaulted (admin only).
     /// Emits a CreditLineDefaulted event.
-    pub fn default_credit_line(env: Env, borrower: Address) -> () {
+    pub fn default_credit_line(env: Env, borrower: Address) {
         require_admin_auth(&env);
 
         let mut credit_line: CreditLineData = env
@@ -360,9 +402,12 @@ impl Credit {
                 risk_score: credit_line.risk_score,
             },
         );
-        ()
     }
 
+    /// Read-only getter for credit line by borrower
+    ///
+    /// @param borrower The address to query
+    /// @return Option<CreditLineData> Full data or None if no line exists
     /// Get credit line data for a borrower (view function).
     pub fn get_credit_line(env: Env, borrower: Address) -> Option<CreditLineData> {
         env.storage().persistent().get(&borrower)
@@ -374,6 +419,39 @@ mod test {
     use super::*;
     use soroban_sdk::testutils::Address as _;
     use soroban_sdk::testutils::Events;
+    use soroban_sdk::{TryFromVal, TryIntoVal};
+
+    /// Helper function to set up test environment with admin, borrower, and contract
+    fn setup_test(env: &Env) -> (Address, Address, Address) {
+        let admin = Address::generate(env);
+        let borrower = Address::generate(env);
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(env, &contract_id);
+
+        env.mock_all_auths();
+
+        client.init(&admin);
+        client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
+
+        (admin, borrower, contract_id)
+    }
+
+    /// Helper function to call contract methods within contract context
+    fn call_contract<F>(env: &Env, contract_id: &Address, f: F)
+    where
+        F: FnOnce(),
+    {
+        env.mock_all_auths();
+        env.as_contract(contract_id, f);
+    }
+
+    /// Helper function to get credit line data
+    fn get_credit_data(env: &Env, contract_id: &Address, borrower: &Address) -> CreditLineData {
+        env.as_contract(contract_id, || {
+            Credit::get_credit_line(env.clone(), borrower.clone())
+                .expect("Credit line should exist")
+        })
+    }
 
     #[test]
     fn test_init_and_open_credit_line() {
@@ -455,6 +533,154 @@ mod test {
 
         let credit_line = client.get_credit_line(&borrower).unwrap();
         assert_eq!(credit_line.status, CreditStatus::Defaulted);
+    }
+
+    #[test]
+    fn test_draw_credit() {
+        let env = Env::default();
+        let (_admin, borrower, contract_id) = setup_test(&env);
+
+        call_contract(&env, &contract_id, || {
+            Credit::draw_credit(env.clone(), borrower.clone(), 500_i128);
+        });
+
+        let credit_data = get_credit_data(&env, &contract_id, &borrower);
+        assert_eq!(credit_data.utilized_amount, 500_i128);
+
+        // Events are emitted - functionality verified through storage changes
+    }
+
+    #[test]
+    fn test_repay_credit_partial() {
+        let env = Env::default();
+        let (_admin, borrower, contract_id) = setup_test(&env);
+
+        // First draw some credit
+        call_contract(&env, &contract_id, || {
+            Credit::draw_credit(env.clone(), borrower.clone(), 500_i128);
+        });
+        assert_eq!(
+            get_credit_data(&env, &contract_id, &borrower).utilized_amount,
+            500_i128
+        );
+
+        // Partial repayment
+        call_contract(&env, &contract_id, || {
+            Credit::repay_credit(env.clone(), borrower.clone(), 200_i128);
+        });
+
+        let credit_data = get_credit_data(&env, &contract_id, &borrower);
+        assert_eq!(credit_data.utilized_amount, 300_i128); // 500 - 200
+    }
+
+    #[test]
+    fn test_repay_credit_full() {
+        let env = Env::default();
+        let (_admin, borrower, contract_id) = setup_test(&env);
+
+        // Draw some credit
+        call_contract(&env, &contract_id, || {
+            Credit::draw_credit(env.clone(), borrower.clone(), 500_i128);
+        });
+        assert_eq!(
+            get_credit_data(&env, &contract_id, &borrower).utilized_amount,
+            500_i128
+        );
+
+        // Full repayment
+        call_contract(&env, &contract_id, || {
+            Credit::repay_credit(env.clone(), borrower.clone(), 500_i128);
+        });
+
+        let credit_data = get_credit_data(&env, &contract_id, &borrower);
+        assert_eq!(credit_data.utilized_amount, 0_i128); // Fully repaid
+    }
+
+    #[test]
+    fn test_repay_credit_overpayment() {
+        let env = Env::default();
+        let (_admin, borrower, contract_id) = setup_test(&env);
+
+        // Draw some credit
+        call_contract(&env, &contract_id, || {
+            Credit::draw_credit(env.clone(), borrower.clone(), 300_i128);
+        });
+        assert_eq!(
+            get_credit_data(&env, &contract_id, &borrower).utilized_amount,
+            300_i128
+        );
+
+        // Overpayment (pay more than utilized)
+        call_contract(&env, &contract_id, || {
+            Credit::repay_credit(env.clone(), borrower.clone(), 500_i128);
+        });
+
+        let credit_data = get_credit_data(&env, &contract_id, &borrower);
+        assert_eq!(credit_data.utilized_amount, 0_i128); // Should be capped at 0
+    }
+
+    #[test]
+    fn test_repay_credit_zero_utilization() {
+        let env = Env::default();
+        let (_admin, borrower, contract_id) = setup_test(&env);
+
+        // Try to repay when no credit is utilized
+        call_contract(&env, &contract_id, || {
+            Credit::repay_credit(env.clone(), borrower.clone(), 100_i128);
+        });
+
+        let credit_data = get_credit_data(&env, &contract_id, &borrower);
+        assert_eq!(credit_data.utilized_amount, 0_i128); // Should remain 0
+    }
+
+    #[test]
+    fn test_repay_credit_suspended_status() {
+        let env = Env::default();
+        let (_admin, borrower, contract_id) = setup_test(&env);
+
+        // Draw some credit
+        call_contract(&env, &contract_id, || {
+            Credit::draw_credit(env.clone(), borrower.clone(), 500_i128);
+        });
+
+        // Manually set status to Suspended
+        let mut credit_data = get_credit_data(&env, &contract_id, &borrower);
+        credit_data.status = CreditStatus::Suspended;
+        env.as_contract(&contract_id, || {
+            env.storage().persistent().set(&borrower, &credit_data);
+        });
+
+        // Should be able to repay even when suspended
+        call_contract(&env, &contract_id, || {
+            Credit::repay_credit(env.clone(), borrower.clone(), 200_i128);
+        });
+
+        let updated_data = get_credit_data(&env, &contract_id, &borrower);
+        assert_eq!(updated_data.utilized_amount, 300_i128);
+        assert_eq!(updated_data.status, CreditStatus::Suspended); // Status should remain Suspended
+    }
+
+    #[test]
+    #[should_panic(expected = "amount must be positive")]
+    fn test_repay_credit_invalid_amount_zero() {
+        let env = Env::default();
+        let (_admin, borrower, contract_id) = setup_test(&env);
+
+        call_contract(&env, &contract_id, || {
+            Credit::repay_credit(env.clone(), borrower.clone(), 0_i128);
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "amount must be positive")]
+    fn test_repay_credit_invalid_amount_negative() {
+        let env = Env::default();
+        let (_admin, borrower, contract_id) = setup_test(&env);
+
+        let negative_amount: i128 = -100;
+        call_contract(&env, &contract_id, || {
+            Credit::repay_credit(env.clone(), borrower.clone(), negative_amount);
+        });
     }
 
     #[test]
@@ -1080,5 +1306,430 @@ mod test {
             client.get_credit_line(&borrower).unwrap().utilized_amount,
             100
         );
+    }
+
+    // ========== EVENT EMISSION TESTS (#42) ==========
+
+    /// Test that repay_credit emits RepaymentEvent with correct payload.
+    #[test]
+    fn test_event_repay_credit_payload() {
+        use soroban_sdk::testutils::Events;
+
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.open_credit_line(&borrower, &5000_i128, &300_u32, &70_u32);
+        client.draw_credit(&borrower, &1000_i128);
+
+        // Repay 400
+        client.repay_credit(&borrower, &400_i128);
+
+        // Get the events (last event is the repay event)
+        let events = env.events().all();
+        let (_contract, topics, data) = events.last().unwrap();
+
+        // Verify event topics
+        assert_eq!(topics.len(), 2);
+        assert_eq!(
+            Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap(),
+            symbol_short!("credit")
+        );
+        assert_eq!(
+            Symbol::try_from_val(&env, &topics.get(1).unwrap()).unwrap(),
+            symbol_short!("repay")
+        );
+
+        // Verify event data
+        let event_data: RepaymentEvent = data.try_into_val(&env).unwrap();
+        assert_eq!(event_data.borrower, borrower);
+        assert_eq!(event_data.amount, 400);
+        assert_eq!(event_data.new_utilized_amount, 600);
+        // Timestamp is populated from ledger
+    }
+
+    /// Test that repay_credit emits correct event for full repayment.
+    #[test]
+    fn test_event_repay_credit_full_amount() {
+        use soroban_sdk::testutils::Events;
+
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.open_credit_line(&borrower, &5000_i128, &300_u32, &70_u32);
+        client.draw_credit(&borrower, &2000_i128);
+
+        // Repay full amount
+        client.repay_credit(&borrower, &2000_i128);
+
+        // Get the events (last event is the repay event)
+        let events = env.events().all();
+        let (_contract, _topics, data) = events.last().unwrap();
+
+        // Verify event data
+        let event_data: RepaymentEvent = data.try_into_val(&env).unwrap();
+        assert_eq!(event_data.borrower, borrower);
+        assert_eq!(event_data.amount, 2000);
+        assert_eq!(event_data.new_utilized_amount, 0);
+        // Timestamp is populated from ledger
+    }
+
+    /// Test that repay_credit emits correct event for overpayment (saturating).
+    #[test]
+    fn test_event_repay_credit_overpayment() {
+        use soroban_sdk::testutils::Events;
+
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.open_credit_line(&borrower, &5000_i128, &300_u32, &70_u32);
+        client.draw_credit(&borrower, &500_i128);
+
+        // Repay more than utilized (should saturate to 0)
+        client.repay_credit(&borrower, &1000_i128);
+
+        // Get the events (last event is the repay event)
+        let events = env.events().all();
+        let (_contract, _topics, data) = events.last().unwrap();
+
+        // Verify event data
+        let event_data: RepaymentEvent = data.try_into_val(&env).unwrap();
+        assert_eq!(event_data.borrower, borrower);
+        assert_eq!(event_data.amount, 1000);
+        assert_eq!(event_data.new_utilized_amount, 0);
+        // Timestamp is populated from ledger
+    }
+
+    /// Test multiple repay events are correctly emitted.
+    #[test]
+    fn test_event_multiple_repayments() {
+        use soroban_sdk::testutils::Events;
+
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.open_credit_line(&borrower, &10000_i128, &300_u32, &70_u32);
+        client.draw_credit(&borrower, &5000_i128);
+
+        // First repayment
+        client.repay_credit(&borrower, &1000_i128);
+        let events = env.events().all();
+        let (_c, _topics, data) = events.last().unwrap();
+        let repay1_data: RepaymentEvent = data.try_into_val(&env).unwrap();
+        assert_eq!(repay1_data.amount, 1000);
+        assert_eq!(repay1_data.new_utilized_amount, 4000);
+
+        // Second repayment
+        client.repay_credit(&borrower, &2000_i128);
+        let events = env.events().all();
+        let (_c, _topics, data) = events.last().unwrap();
+        let repay2_data: RepaymentEvent = data.try_into_val(&env).unwrap();
+        assert_eq!(repay2_data.amount, 2000);
+        assert_eq!(repay2_data.new_utilized_amount, 2000);
+
+        // Third repayment
+        client.repay_credit(&borrower, &1500_i128);
+        let events = env.events().all();
+        let (_c, _topics, data) = events.last().unwrap();
+        let repay3_data: RepaymentEvent = data.try_into_val(&env).unwrap();
+        assert_eq!(repay3_data.amount, 1500);
+        assert_eq!(repay3_data.new_utilized_amount, 500);
+    }
+
+    /// Test that open_credit_line emits CreditLineEvent with correct payload.
+    #[test]
+    fn test_event_open_credit_line() {
+        use soroban_sdk::testutils::Events;
+
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
+
+        // Get the events
+        let events = env.events().all();
+        let (_contract, topics, data) = events.last().unwrap();
+
+        // Verify event topics
+        assert_eq!(topics.len(), 2);
+        assert_eq!(
+            Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap(),
+            symbol_short!("credit")
+        );
+        assert_eq!(
+            Symbol::try_from_val(&env, &topics.get(1).unwrap()).unwrap(),
+            symbol_short!("opened")
+        );
+
+        // Verify event data
+        let event_data: CreditLineEvent = data.try_into_val(&env).unwrap();
+        assert_eq!(event_data.event_type, symbol_short!("opened"));
+        assert_eq!(event_data.borrower, borrower);
+        assert_eq!(event_data.status, CreditStatus::Active);
+        assert_eq!(event_data.credit_limit, 1000);
+        assert_eq!(event_data.interest_rate_bps, 300);
+        assert_eq!(event_data.risk_score, 70);
+    }
+
+    /// Test that suspend_credit_line emits CreditLineEvent with correct payload.
+    #[test]
+    fn test_event_suspend_credit_line() {
+        use soroban_sdk::testutils::Events;
+
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
+        client.suspend_credit_line(&borrower);
+
+        // Get the events (last event is the suspend event)
+        let events = env.events().all();
+        let (_contract, topics, data) = events.last().unwrap();
+
+        // Verify event topics
+        assert_eq!(topics.len(), 2);
+        assert_eq!(
+            Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap(),
+            symbol_short!("credit")
+        );
+        assert_eq!(
+            Symbol::try_from_val(&env, &topics.get(1).unwrap()).unwrap(),
+            symbol_short!("suspend")
+        );
+
+        // Verify event data
+        let event_data: CreditLineEvent = data.try_into_val(&env).unwrap();
+        assert_eq!(event_data.event_type, symbol_short!("suspend"));
+        assert_eq!(event_data.borrower, borrower);
+        assert_eq!(event_data.status, CreditStatus::Suspended);
+        assert_eq!(event_data.credit_limit, 1000);
+        assert_eq!(event_data.interest_rate_bps, 300);
+        assert_eq!(event_data.risk_score, 70);
+    }
+
+    /// Test that close_credit_line emits CreditLineEvent with correct payload.
+    #[test]
+    fn test_event_close_credit_line() {
+        use soroban_sdk::testutils::Events;
+
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.open_credit_line(&borrower, &2000_i128, &400_u32, &80_u32);
+        client.close_credit_line(&borrower, &admin);
+
+        // Get the events (last event is the close event)
+        let events = env.events().all();
+        let (_contract, topics, data) = events.last().unwrap();
+
+        // Verify event topics
+        assert_eq!(topics.len(), 2);
+        assert_eq!(
+            Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap(),
+            symbol_short!("credit")
+        );
+        assert_eq!(
+            Symbol::try_from_val(&env, &topics.get(1).unwrap()).unwrap(),
+            symbol_short!("closed")
+        );
+
+        // Verify event data
+        let event_data: CreditLineEvent = data.try_into_val(&env).unwrap();
+        assert_eq!(event_data.event_type, symbol_short!("closed"));
+        assert_eq!(event_data.borrower, borrower);
+        assert_eq!(event_data.status, CreditStatus::Closed);
+        assert_eq!(event_data.credit_limit, 2000);
+        assert_eq!(event_data.interest_rate_bps, 400);
+        assert_eq!(event_data.risk_score, 80);
+    }
+
+    /// Test that default_credit_line emits CreditLineEvent with correct payload.
+    #[test]
+    fn test_event_default_credit_line() {
+        use soroban_sdk::testutils::Events;
+
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.open_credit_line(&borrower, &3000_i128, &500_u32, &90_u32);
+        client.default_credit_line(&borrower);
+
+        // Get the events (last event is the default event)
+        let events = env.events().all();
+        let (_contract, topics, data) = events.last().unwrap();
+
+        // Verify event topics
+        assert_eq!(topics.len(), 2);
+        assert_eq!(
+            Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap(),
+            symbol_short!("credit")
+        );
+        assert_eq!(
+            Symbol::try_from_val(&env, &topics.get(1).unwrap()).unwrap(),
+            symbol_short!("default")
+        );
+
+        // Verify event data
+        let event_data: CreditLineEvent = data.try_into_val(&env).unwrap();
+        assert_eq!(event_data.event_type, symbol_short!("default"));
+        assert_eq!(event_data.borrower, borrower);
+        assert_eq!(event_data.status, CreditStatus::Defaulted);
+        assert_eq!(event_data.credit_limit, 3000);
+        assert_eq!(event_data.interest_rate_bps, 500);
+        assert_eq!(event_data.risk_score, 90);
+    }
+
+    /// Test lifecycle event sequence: open -> suspend -> close.
+    #[test]
+    fn test_event_lifecycle_sequence() {
+        use soroban_sdk::testutils::Events;
+
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+
+        // Open credit line and check event
+        client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
+        let events = env.events().all();
+        let (_c, topics, data) = events.last().unwrap();
+        assert_eq!(
+            Symbol::try_from_val(&env, &topics.get(1).unwrap()).unwrap(),
+            symbol_short!("opened")
+        );
+        let open_data: CreditLineEvent = data.try_into_val(&env).unwrap();
+        assert_eq!(open_data.status, CreditStatus::Active);
+
+        // Suspend credit line and check event
+        client.suspend_credit_line(&borrower);
+        let events = env.events().all();
+        let (_c, topics, data) = events.last().unwrap();
+        assert_eq!(
+            Symbol::try_from_val(&env, &topics.get(1).unwrap()).unwrap(),
+            symbol_short!("suspend")
+        );
+        let suspend_data: CreditLineEvent = data.try_into_val(&env).unwrap();
+        assert_eq!(suspend_data.status, CreditStatus::Suspended);
+
+        // Close credit line and check event
+        client.close_credit_line(&borrower, &admin);
+        let events = env.events().all();
+        let (_c, topics, data) = events.last().unwrap();
+        assert_eq!(
+            Symbol::try_from_val(&env, &topics.get(1).unwrap()).unwrap(),
+            symbol_short!("closed")
+        );
+        let close_data: CreditLineEvent = data.try_into_val(&env).unwrap();
+        assert_eq!(close_data.status, CreditStatus::Closed);
+    }
+
+    /// Test that event data remains consistent across lifecycle operations.
+    #[test]
+    fn test_event_data_consistency_across_lifecycle() {
+        use soroban_sdk::testutils::Events;
+
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+
+        // Open with specific parameters
+        let credit_limit = 7500_i128;
+        let interest_rate = 450_u32;
+        let risk_score = 85_u32;
+
+        // Open and verify event data
+        client.open_credit_line(&borrower, &credit_limit, &interest_rate, &risk_score);
+        let events = env.events().all();
+        let (_c, _topics, data) = events.last().unwrap();
+        let open_data: CreditLineEvent = data.try_into_val(&env).unwrap();
+        assert_eq!(open_data.credit_limit, credit_limit);
+        assert_eq!(open_data.interest_rate_bps, interest_rate);
+        assert_eq!(open_data.risk_score, risk_score);
+
+        // Suspend and verify event data consistency
+        client.suspend_credit_line(&borrower);
+        let events = env.events().all();
+        let (_c, _topics, data) = events.last().unwrap();
+        let suspend_data: CreditLineEvent = data.try_into_val(&env).unwrap();
+        assert_eq!(suspend_data.credit_limit, credit_limit);
+        assert_eq!(suspend_data.interest_rate_bps, interest_rate);
+        assert_eq!(suspend_data.risk_score, risk_score);
+
+        // Default and verify event data consistency
+        client.default_credit_line(&borrower);
+        let events = env.events().all();
+        let (_c, _topics, data) = events.last().unwrap();
+        let default_data: CreditLineEvent = data.try_into_val(&env).unwrap();
+        assert_eq!(default_data.credit_limit, credit_limit);
+        assert_eq!(default_data.interest_rate_bps, interest_rate);
+        assert_eq!(default_data.risk_score, risk_score);
     }
 }
