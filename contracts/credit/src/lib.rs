@@ -23,10 +23,12 @@ use types::{CreditLineData, CreditStatus};
 const MAX_INTEREST_RATE_BPS: u32 = 10_000;
 /// Maximum risk score (0–100 scale).
 const MAX_RISK_SCORE: u32 = 100;
+
 /// Instance storage key for reentrancy guard.
 fn reentrancy_key(env: &Env) -> Symbol {
     Symbol::new(env, "reentrancy")
 }
+
 /// Instance storage key for admin.
 fn admin_key(env: &Env) -> Symbol {
     Symbol::new(env, "admin")
@@ -997,7 +999,87 @@ mod test {
         );
     }
 
-    // --- update_risk_parameters (#9) ---
+    // --- draw_credit: zero and negative amount guards ---
+
+    #[test]
+    #[should_panic(expected = "amount must be positive")]
+    fn test_draw_credit_rejected_when_amount_is_zero() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
+
+        // Should panic: zero is not a positive amount
+        client.draw_credit(&borrower, &0_i128);
+    }
+
+    #[test]
+    #[should_panic(expected = "amount must be positive")]
+    fn test_draw_credit_rejected_when_amount_is_negative() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
+
+        // i128 allows negatives — the guard `amount <= 0` must catch this
+        client.draw_credit(&borrower, &-1_i128);
+    }
+
+    // --- repay_credit: zero and negative amount guards ---
+
+    #[test]
+    #[should_panic(expected = "amount must be positive")]
+    fn test_repay_credit_rejects_non_positive_amount() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
+
+        // Should panic: repaying zero is meaningless and must be rejected
+        client.repay_credit(&borrower, &0_i128);
+    }
+
+    #[test]
+    #[should_panic(expected = "amount must be positive")]
+    fn test_repay_credit_rejected_when_amount_is_negative() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
+
+        // Negative repayment would effectively be a draw — must be rejected
+        client.repay_credit(&borrower, &-500_i128);
+    }
+
+    // --- update_risk_parameters ---
 
     #[test]
     fn test_update_risk_parameters_success() {
@@ -1143,7 +1225,7 @@ mod test {
         assert_eq!(credit_line.risk_score, 100);
     }
 
-    // --- repay_credit + RepaymentEvent (#14) ---
+    // --- repay_credit: happy path and event emission ---
 
     #[test]
     fn test_repay_credit_reduces_utilized_and_emits_event() {
@@ -1194,23 +1276,6 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "amount must be positive")]
-    fn test_repay_credit_rejects_non_positive_amount() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let admin = Address::generate(&env);
-        let borrower = Address::generate(&env);
-
-        let contract_id = env.register(Credit, ());
-        let client = CreditClient::new(&env, &contract_id);
-
-        client.init(&admin);
-        client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
-        client.repay_credit(&borrower, &0_i128);
-    }
-
-    #[test]
     #[should_panic(expected = "Credit line not found")]
     fn test_repay_credit_nonexistent_line() {
         let env = Env::default();
@@ -1226,7 +1291,7 @@ mod test {
         client.repay_credit(&borrower, &100_i128);
     }
 
-    // --- suspend/default admin-only: unauthorized caller ---
+    // --- suspend/default: unauthorized caller ---
 
     #[test]
     #[should_panic]
@@ -1258,12 +1323,11 @@ mod test {
         client.default_credit_line(&borrower);
     }
 
-    // --- Reentrancy guard (#51): guard prevents nested entrypoint call ---
-    // We cannot simulate token callback in unit tests without a mock contract.
-    // The guard is exercised indirectly: draw_credit and repay_credit set/clear it.
-    // This test verifies that a second draw in the same "invocation" would need to
-    // go through the same entrypoint; in production, if token called back into
-    // draw_credit/repay_credit, the guard would panic.
+    // --- Reentrancy guard: cleared correctly after draw and repay ---
+    //
+    // We cannot simulate a token callback in unit tests without a mock contract.
+    // These tests verify the guard is cleared on the happy path so that sequential
+    // calls succeed, proving no guard leak occurs on successful execution.
 
     #[test]
     fn test_reentrancy_guard_cleared_after_draw() {
