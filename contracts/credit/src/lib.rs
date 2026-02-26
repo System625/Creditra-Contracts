@@ -166,7 +166,6 @@ impl Credit {
                 "borrower already has an active credit line"
             );
         }
-
         let credit_line = CreditLineData {
             borrower: borrower.clone(),
             credit_limit,
@@ -362,7 +361,6 @@ impl Credit {
     /// Emits a CreditLineSuspended event.
     pub fn suspend_credit_line(env: Env, borrower: Address) {
         require_admin_auth(&env);
-
         let mut credit_line: CreditLineData = env
             .storage()
             .persistent()
@@ -443,7 +441,6 @@ impl Credit {
     /// Emits a CreditLineDefaulted event.
     pub fn default_credit_line(env: Env, borrower: Address) {
         require_admin_auth(&env);
-
         let mut credit_line: CreditLineData = env
             .storage()
             .persistent()
