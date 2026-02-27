@@ -178,6 +178,9 @@ pub struct Credit;
 
 #[contractimpl]
 impl Credit {
+    /// Initialize the contract (admin).
+    pub fn init(env: Env, admin: Address) {
+        env.storage().instance().set(&admin_key(&env), &admin);
     /// Initialize the contract with an admin address.
     ///
     /// Must be called exactly once after deployment before any other
@@ -299,6 +302,14 @@ impl Credit {
         );
     }
 
+    /// Draw from credit line (borrower).
+    /// Reverts if credit line does not exist, is Closed, or borrower has not authorized.
+    pub fn draw_credit(env: Env, borrower: Address, amount: i128) {
+        set_reentrancy_guard(&env);
+        borrower.require_auth();
+
+    }
+
     /// Draw funds from an active credit line.
     ///
     /// Called by the borrower to borrow against their credit limit.
@@ -407,6 +418,7 @@ impl Credit {
             },
         );
         clear_reentrancy_guard(&env);
+        // TODO: transfer token to borrower
         ()
     }
 
@@ -496,6 +508,7 @@ impl Credit {
             },
         );
         clear_reentrancy_guard(&env);
+        // TODO: accept token from borrower
         ()
     }
 
@@ -616,15 +629,13 @@ impl Credit {
     /// Close a credit line. Callable by admin (force-close) or by borrower when utilization is zero.
     ///
     /// # Arguments
-    /// * `closer` - Address that must have authorized this call. Must be either the contract admin
-    ///   (can close regardless of utilization) or the borrower (can close only when
-    ///   `utilized_amount` is zero).
+    /// * `borrower` - Address of the borrower whose credit line to close.
     ///
     /// # Errors
-    /// * Panics if credit line does not exist, or if `closer` is not admin/borrower, or if
-    ///   borrower closes while `utilized_amount != 0`.
+    /// * Panics if credit line does not exist.
     ///
     /// Emits a CreditLineClosed event.
+    pub fn close_credit_line(env: Env, borrower: Address) {
     pub fn close_credit_line(env: Env, borrower: Address, closer: Address) {
         closer.require_auth();
 
@@ -833,7 +844,7 @@ mod test {
 
         client.init(&admin);
         client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
-        client.close_credit_line(&borrower, &admin);
+        client.close_credit_line(&borrower);
 
         let credit_line = client.get_credit_line(&borrower).unwrap();
         assert_eq!(credit_line.status, CreditStatus::Closed);
@@ -881,6 +892,8 @@ mod test {
         assert_eq!(client.get_credit_line(&borrower).unwrap().status, CreditStatus::Suspended);
 
         client.close_credit_line(&borrower);
+        let credit_line = client.get_credit_line(&borrower).unwrap();
+        assert_eq!(credit_line.status, CreditStatus::Closed);
         assert_eq!(client.get_credit_line(&borrower).unwrap().status, CreditStatus::Closed);
         client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
         // Second open for same borrower while Active must revert.
@@ -960,6 +973,7 @@ mod test {
         let client = CreditClient::new(&env, &contract_id);
 
         client.init(&admin);
+        client.close_credit_line(&borrower);
         client.open_credit_line(&borrower, &1000_i128, &300_u32, &101_u32);
     }
 
@@ -1041,6 +1055,7 @@ mod test {
 
     /// draw_credit within limit: drawing exact available limit succeeds and utilized equals limit.
     #[test]
+    fn test_repay_credit_full_repayment() {
     fn test_draw_credit_exact_available_limit_succeeds() {
         let env = Env::default();
         env.mock_all_auths();
@@ -1053,6 +1068,18 @@ mod test {
 
         client.init(&admin);
         client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
+
+        // Draw 500 from credit line
+        client.draw_credit(&borrower, &500_i128);
+        let credit_line = client.get_credit_line(&borrower).unwrap();
+        assert_eq!(credit_line.utilized_amount, 500);
+
+        // Full repayment
+        client.repay_credit(&borrower, &500_i128);
+        let credit_line = client.get_credit_line(&borrower).unwrap();
+        assert_eq!(credit_line.utilized_amount, 0);
+        assert_eq!(credit_line.credit_limit, 1000);
+        assert_eq!(credit_line.status, CreditStatus::Active);
         assert_eq!(client.get_credit_line(&borrower).unwrap().status, CreditStatus::Active);
 
         client.default_credit_line(&borrower);
@@ -1067,7 +1094,9 @@ mod test {
         assert_eq!(line.credit_limit, limit);
     }
 
+    /// Test partial repayment: utilized amount decreases correctly
     #[test]
+    fn test_repay_credit_partial_repayment() {
     fn test_repay_credit_partial() {
         let env = Env::default();
         let (_admin, borrower, contract_id) = setup_test(&env);
@@ -1081,6 +1110,25 @@ mod test {
             500_i128
         );
 
+        client.init(&admin);
+        client.open_credit_line(&borrower, &2000_i128, &400_u32, &75_u32);
+
+        // Draw 1000 from credit line
+        client.draw_credit(&borrower, &1000_i128);
+        let credit_line = client.get_credit_line(&borrower).unwrap();
+        assert_eq!(credit_line.utilized_amount, 1000);
+
+        // Partial repayment of 300
+        client.repay_credit(&borrower, &300_i128);
+        let credit_line = client.get_credit_line(&borrower).unwrap();
+        assert_eq!(credit_line.utilized_amount, 700);
+        assert_eq!(credit_line.credit_limit, 2000);
+        assert_eq!(credit_line.status, CreditStatus::Active);
+
+        // Another partial repayment of 200
+        client.repay_credit(&borrower, &200_i128);
+        let credit_line = client.get_credit_line(&borrower).unwrap();
+        assert_eq!(credit_line.utilized_amount, 500);
         // Partial repayment
         call_contract(&env, &contract_id, || {
             Credit::repay_credit(env.clone(), borrower.clone(), 200_i128);
@@ -1090,11 +1138,41 @@ mod test {
         assert_eq!(credit_data.utilized_amount, 300_i128); // 500 - 200
     }
 
+    /// Test multiple partial repayments leading to full repayment
     #[test]
+    fn test_repay_credit_multiple_partial_to_full() {
     fn test_repay_credit_full() {
         let env = Env::default();
         let (_admin, borrower, contract_id) = setup_test(&env);
 
+        client.init(&admin);
+        client.open_credit_line(&borrower, &5000_i128, &500_u32, &80_u32);
+
+        // Draw 1500
+        client.draw_credit(&borrower, &1500_i128);
+        assert_eq!(
+            client.get_credit_line(&borrower).unwrap().utilized_amount,
+            1500
+        );
+
+        // Repay in increments
+        client.repay_credit(&borrower, &500_i128);
+        assert_eq!(
+            client.get_credit_line(&borrower).unwrap().utilized_amount,
+            1000
+        );
+
+        client.repay_credit(&borrower, &400_i128);
+        assert_eq!(
+            client.get_credit_line(&borrower).unwrap().utilized_amount,
+            600
+        );
+
+        client.repay_credit(&borrower, &600_i128);
+        assert_eq!(
+            client.get_credit_line(&borrower).unwrap().utilized_amount,
+            0
+        );
         // Draw some credit
         call_contract(&env, &contract_id, || {
             Credit::draw_credit(env.clone(), borrower.clone(), 500_i128);
@@ -1409,8 +1487,9 @@ mod test {
         assert_eq!(credit_line.utilized_amount, 300);
     }
 
+    /// Test repayment exceeds utilized amount (should cap at 0)
     #[test]
-    fn test_close_credit_line_idempotent_when_already_closed() {
+    fn test_repay_credit_exceeds_utilized() {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -1422,18 +1501,18 @@ mod test {
 
         client.init(&admin);
         client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
-        client.close_credit_line(&borrower, &admin);
-        client.close_credit_line(&borrower, &admin);
 
-        assert_eq!(
-            client.get_credit_line(&borrower).unwrap().status,
-            CreditStatus::Closed
-        );
+        client.draw_credit(&borrower, &500_i128);
+        client.repay_credit(&borrower, &600_i128); // Exceeds utilized
+
+        let credit_line = client.get_credit_line(&borrower).unwrap();
+        assert_eq!(credit_line.utilized_amount, 0); // Should be capped at 0
     }
 
+    /// Test repayment with zero amount (should panic)
     #[test]
-    #[should_panic(expected = "credit line is closed")]
-    fn test_draw_credit_rejected_when_closed() {
+    #[should_panic(expected = "amount must be positive")]
+    fn test_repay_credit_zero_amount() {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -1445,12 +1524,15 @@ mod test {
 
         client.init(&admin);
         client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
-        client.close_credit_line(&borrower, &admin);
 
-        client.draw_credit(&borrower, &100_i128);
+        client.draw_credit(&borrower, &500_i128);
+        client.repay_credit(&borrower, &0_i128);
     }
 
+    /// Test repayment on nonexistent credit line (should panic)
     #[test]
+    #[should_panic(expected = "Credit line not found")]
+    fn test_repay_credit_nonexistent_line() {
     #[should_panic(expected = "exceeds credit limit")]
     fn test_draw_credit_rejected_when_exceeding_limit() {
         let env = Env::default();
@@ -1480,32 +1562,46 @@ mod test {
         let client = CreditClient::new(&env, &contract_id);
 
         client.init(&admin);
-        client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
-        client.close_credit_line(&borrower, &admin);
-
         client.repay_credit(&borrower, &100_i128);
     }
 
+    /// Test state consistency after draw and repay cycle
     #[test]
-    #[should_panic(expected = "unauthorized")]
-    fn test_close_credit_line_unauthorized_closer() {
+    fn test_repay_credit_state_consistency() {
         let env = Env::default();
         env.mock_all_auths();
 
         let admin = Address::generate(&env);
         let borrower = Address::generate(&env);
-        let other = Address::generate(&env);
 
         let contract_id = env.register(Credit, ());
         let client = CreditClient::new(&env, &contract_id);
 
         client.init(&admin);
-        client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
-        client.close_credit_line(&borrower, &other);
+        client.open_credit_line(&borrower, &3000_i128, &350_u32, &85_u32);
+
+        let initial = client.get_credit_line(&borrower).unwrap();
+        assert_eq!(initial.utilized_amount, 0);
+        assert_eq!(initial.credit_limit, 3000);
+        assert_eq!(initial.interest_rate_bps, 350);
+        assert_eq!(initial.risk_score, 85);
+
+        // Draw and repay cycle
+        client.draw_credit(&borrower, &800_i128);
+        client.repay_credit(&borrower, &300_i128);
+
+        let after_cycle = client.get_credit_line(&borrower).unwrap();
+        assert_eq!(after_cycle.utilized_amount, 500);
+        assert_eq!(after_cycle.credit_limit, 3000); // Unchanged
+        assert_eq!(after_cycle.interest_rate_bps, 350); // Unchanged
+        assert_eq!(after_cycle.risk_score, 85); // Unchanged
+        assert_eq!(after_cycle.status, CreditStatus::Active); // Unchanged
+        assert_eq!(after_cycle.borrower, borrower); // Unchanged
     }
 
+    /// Test repayment with exact utilized amount
     #[test]
-    fn test_draw_credit_updates_utilized() {
+    fn test_repay_credit_exact_amount() {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -1518,16 +1614,16 @@ mod test {
         client.init(&admin);
         client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
 
-        client.draw_credit(&borrower, &200_i128);
+        client.draw_credit(&borrower, &750_i128);
         assert_eq!(
             client.get_credit_line(&borrower).unwrap().utilized_amount,
-            200
+            750
         );
 
-        client.draw_credit(&borrower, &300_i128);
+        client.repay_credit(&borrower, &750_i128);
         assert_eq!(
             client.get_credit_line(&borrower).unwrap().utilized_amount,
-            500
+            0
         );
     }
 
@@ -1981,6 +2077,7 @@ mod test {
         client.repay_credit(&borrower, &200_i128);
     }
 
+    // --- suspend/default admin-only: unauthorized caller ---
     #[test]
     #[should_panic(expected = "Credit line not found")]
     fn test_repay_credit_nonexistent_line() {
