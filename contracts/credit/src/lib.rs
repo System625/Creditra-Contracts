@@ -412,6 +412,8 @@ impl Credit {
 
     /// Repay credit (borrower).
     /// Reverts if credit line does not exist, is Closed, or borrower has not authorized.
+    /// If a liquidity token is configured, transfers that token from the borrower to the
+    /// configured liquidity source via allowance + transfer_from.
     /// Reduces utilized_amount by amount (capped at 0). Emits RepaymentEvent.
     pub fn repay_credit(env: Env, borrower: Address, amount: i128) {
         set_reentrancy_guard(&env);
@@ -434,22 +436,67 @@ impl Credit {
             clear_reentrancy_guard(&env);
             panic!("amount must be positive");
         }
-        let new_utilized = credit_line.utilized_amount.saturating_sub(amount).max(0);
+
+        // Apply at most the outstanding utilized amount to avoid over-charging on overpayment.
+        let repay_amount = if amount > credit_line.utilized_amount {
+            credit_line.utilized_amount
+        } else {
+            amount
+        };
+
+        let new_utilized = credit_line
+            .utilized_amount
+            .saturating_sub(repay_amount)
+            .max(0);
         credit_line.utilized_amount = new_utilized;
         env.storage().persistent().set(&borrower, &credit_line);
+
+        if repay_amount > 0 {
+            let token_address: Option<Address> =
+                env.storage().instance().get(&DataKey::LiquidityToken);
+            let reserve_address: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::LiquiditySource)
+                .unwrap_or(env.current_contract_address());
+
+            if let Some(token_address) = token_address {
+                let token_client = token::Client::new(&env, &token_address);
+                let contract_address = env.current_contract_address();
+
+                let allowance = token_client.allowance(&borrower, &contract_address);
+                if allowance < repay_amount {
+                    clear_reentrancy_guard(&env);
+                    panic!("Insufficient allowance");
+                }
+
+                let balance = token_client.balance(&borrower);
+                if balance < repay_amount {
+                    clear_reentrancy_guard(&env);
+                    panic!("Insufficient balance");
+                }
+
+                token_client.transfer_from(
+                    &contract_address,
+                    &borrower,
+                    &reserve_address,
+                    &repay_amount,
+                );
+            }
+        }
 
         let timestamp = env.ledger().timestamp();
         publish_repayment_event(
             &env,
             RepaymentEvent {
                 borrower: borrower.clone(),
-                amount,
+                amount: repay_amount,
                 new_utilized_amount: new_utilized,
                 timestamp,
             },
         );
         clear_reentrancy_guard(&env);
-        // TODO: accept token from borrower
+        ()
     }
 
     /// Update risk parameters for an existing credit line (admin only).
@@ -715,6 +762,18 @@ mod test {
         client
             .get_credit_line(borrower)
             .expect("Credit line not found")
+    }
+
+    fn approve_token_spend(
+        env: &Env,
+        token_address: &Address,
+        owner: &Address,
+        spender: &Address,
+        amount: i128,
+    ) {
+        let token_client = token::Client::new(env, token_address);
+        let expiration_ledger = 1_000_u32;
+        token_client.approve(owner, spender, &amount, &expiration_ledger);
     }
 
     #[test]
@@ -1745,6 +1804,181 @@ mod test {
 
         let credit_line = client.get_credit_line(&borrower).unwrap();
         assert_eq!(credit_line.utilized_amount, 0);
+    }
+
+    // --- repay_credit: token acceptance (SEP-41) ---
+
+    #[test]
+    fn test_repay_credit_transfers_token_and_consumes_allowance() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.open_credit_line(&borrower, &1_000_i128, &300_u32, &70_u32);
+
+        // Create utilization without requiring any token liquidity.
+        client.draw_credit(&borrower, &300_i128);
+
+        let token = env.register_stellar_asset_contract_v2(token_admin);
+        let token_admin_client = StellarAssetClient::new(&env, &token.address());
+        let token_client = token::Client::new(&env, &token.address());
+
+        client.set_liquidity_token(&token.address());
+
+        // Fund the borrower so they can repay using transfer_from.
+        token_admin_client.mint(&borrower, &300_i128);
+
+        let repay_amount = 200_i128;
+        approve_token_spend(
+            &env,
+            &token.address(),
+            &borrower,
+            &contract_id,
+            repay_amount,
+        );
+
+        let borrower_balance_before = token_client.balance(&borrower);
+        let reserve_balance_before = token_client.balance(&contract_id);
+        let allowance_before = token_client.allowance(&borrower, &contract_id);
+
+        client.repay_credit(&borrower, &repay_amount);
+
+        let borrower_balance_after = token_client.balance(&borrower);
+        let reserve_balance_after = token_client.balance(&contract_id);
+        let allowance_after = token_client.allowance(&borrower, &contract_id);
+
+        assert_eq!(
+            borrower_balance_before - borrower_balance_after,
+            repay_amount
+        );
+        assert_eq!(reserve_balance_after - reserve_balance_before, repay_amount);
+        assert_eq!(allowance_before - allowance_after, repay_amount);
+        assert_eq!(
+            client.get_credit_line(&borrower).unwrap().utilized_amount,
+            100_i128
+        );
+    }
+
+    #[test]
+    fn test_repay_credit_transfers_token_to_configured_liquidity_source() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let reserve = Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.open_credit_line(&borrower, &1_000_i128, &300_u32, &70_u32);
+
+        // Create utilization without requiring any token liquidity.
+        client.draw_credit(&borrower, &250_i128);
+
+        let token = env.register_stellar_asset_contract_v2(token_admin);
+        let token_admin_client = StellarAssetClient::new(&env, &token.address());
+        let token_client = token::Client::new(&env, &token.address());
+
+        client.set_liquidity_token(&token.address());
+        client.set_liquidity_source(&reserve);
+
+        token_admin_client.mint(&borrower, &250_i128);
+
+        let repay_amount = 100_i128;
+        approve_token_spend(
+            &env,
+            &token.address(),
+            &borrower,
+            &contract_id,
+            repay_amount,
+        );
+
+        let borrower_balance_before = token_client.balance(&borrower);
+        let reserve_balance_before = token_client.balance(&reserve);
+        let allowance_before = token_client.allowance(&borrower, &contract_id);
+
+        client.repay_credit(&borrower, &repay_amount);
+
+        assert_eq!(
+            token_client.balance(&borrower),
+            borrower_balance_before - repay_amount
+        );
+        assert_eq!(
+            token_client.balance(&reserve),
+            reserve_balance_before + repay_amount
+        );
+        assert_eq!(
+            token_client.allowance(&borrower, &contract_id),
+            allowance_before - repay_amount
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Insufficient allowance")]
+    fn test_repay_credit_reverts_on_insufficient_allowance() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.open_credit_line(&borrower, &1_000_i128, &300_u32, &70_u32);
+        client.draw_credit(&borrower, &200_i128);
+
+        let token = env.register_stellar_asset_contract_v2(token_admin);
+        let token_admin_client = StellarAssetClient::new(&env, &token.address());
+
+        client.set_liquidity_token(&token.address());
+        token_admin_client.mint(&borrower, &200_i128);
+
+        // Approve less than the repay amount.
+        approve_token_spend(&env, &token.address(), &borrower, &contract_id, 50_i128);
+
+        client.repay_credit(&borrower, &200_i128);
+    }
+
+    #[test]
+    #[should_panic(expected = "Insufficient balance")]
+    fn test_repay_credit_reverts_on_insufficient_balance() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.open_credit_line(&borrower, &1_000_i128, &300_u32, &70_u32);
+        client.draw_credit(&borrower, &200_i128);
+
+        let token = env.register_stellar_asset_contract_v2(token_admin);
+        let token_admin_client = StellarAssetClient::new(&env, &token.address());
+
+        client.set_liquidity_token(&token.address());
+
+        // Fund borrower with less than repayment amount but approve full amount.
+        token_admin_client.mint(&borrower, &50_i128);
+        approve_token_spend(&env, &token.address(), &borrower, &contract_id, 200_i128);
+
+        client.repay_credit(&borrower, &200_i128);
     }
 
     #[test]

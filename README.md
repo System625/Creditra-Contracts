@@ -18,6 +18,7 @@ This repo contains the **credit** contract: it maintains credit lines, tracks ut
 - `draw_credit` now checks configured liquidity token balance at the configured liquidity source before transfer.
 - If reserve balance is less than requested draw amount, the transaction reverts with: `Insufficient liquidity reserve for requested draw amount`.
 - `init` defaults liquidity source to the contract address.
+- `repay_credit` (when a liquidity token is configured) uses `transfer_from` to move tokens from the borrower to the configured liquidity source; borrowers must approve an allowance for the credit contract.
 - Admin can configure:
   - `set_liquidity_token` — token contract used for reserve and draw transfers.
   - `set_liquidity_source` — reserve address to fund draws (contract or external source).
